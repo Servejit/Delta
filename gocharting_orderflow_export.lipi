@@ -1,0 +1,11 @@
+indicator("Delta Scanner Export", "DeltaScannerExport", false)
+
+plot(orderflow.delta, title="Delta")
+plot(orderflow.buyvolume, title="BuyVolume")
+plot(orderflow.sellvolume, title="SellVolume")
+plot(orderflow.maxdelta, title="MaxDelta")
+plot(orderflow.mindelta, title="MinDelta")
+plot(orderflow.cvd(), title="CVD")
+plot(orderflow.buy, title="Buy")
+plot(orderflow.sell, title="Sell")
+plot(orderflow.trades, title="Trades")

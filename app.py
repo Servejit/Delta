@@ -183,39 +183,137 @@ def read_orderflow(uploaded_items):
     return result.sort_values(["Symbol", "DateTime"]).reset_index(drop=True)
 
 def orderflow_analysis(symbol, df, real_of):
+    """Score genuine footprint/order-flow data, with safe OHLCV fallback."""
     r = df.iloc[-1]
-
     if not real_of.empty:
-        rows = real_of[real_of["Symbol"] == symbol]
+        rows = real_of[real_of["Symbol"] == symbol].sort_values("DateTime").copy()
         if not rows.empty:
             row = rows.iloc[-1]
-            delta = pd.to_numeric(row["Delta"], errors="coerce")
-            buy = pd.to_numeric(row["BuyVolume"], errors="coerce")
-            sell = pd.to_numeric(row["SellVolume"], errors="coerce")
-            max_delta = pd.to_numeric(row["MaxDelta"], errors="coerce")
-            min_delta = pd.to_numeric(row["MinDelta"], errors="coerce")
-            cvd = pd.to_numeric(row["CVD"], errors="coerce")
+            delta = pd.to_numeric(row.get("delta"), errors="coerce")
+            buy = pd.to_numeric(row.get("buyvolume"), errors="coerce")
+            sell = pd.to_numeric(row.get("sellvolume"), errors="coerce")
+            max_delta = pd.to_numeric(row.get("maxdelta"), errors="coerce")
+            min_delta = pd.to_numeric(row.get("mindelta"), errors="coerce")
+            cvd = pd.to_numeric(row.get("cvd"), errors="coerce")
+
             score = 0
             reasons = []
-            if pd.notna(delta):
-                score += 2 if delta > 0 else -2 if delta < 0 else 0
-                reasons.append("real positive Delta" if delta > 0 else "real negative Delta" if delta < 0 else "neutral Delta")
-            if pd.notna(max_delta) and pd.notna(min_delta):
-                if max_delta > abs(min_delta) * 1.5:
-                    score += 2
-                    reasons.append("buy-side Delta excursion")
-                elif abs(min_delta) > max_delta * 1.5:
-                    score -= 2
-                    reasons.append("sell-side Delta excursion")
-            direction = "BUY" if score >= 3 else "SELL" if score <= -3 else "NEUTRAL"
-            delta_pct = np.nan
-            if pd.notna(buy) and pd.notna(sell) and buy + sell:
-                delta_pct = (buy - sell) / (buy + sell) * 100
-            return {"source": "GOCHARTING_REAL", "delta": delta, "buy": buy, "sell": sell,
-                    "max_delta": max_delta, "min_delta": min_delta, "cvd": cvd,
-                    "delta_pct": delta_pct, "score": score, "direction": direction,
-                    "reason": "; ".join(reasons)}
 
+            # Delta direction and relative strength.
+            side_total = np.nan
+            delta_pct = np.nan
+            if pd.notna(buy) and pd.notna(sell):
+                side_total = buy + sell
+                if side_total > 0:
+                    delta_pct = (buy - sell) / side_total * 100
+
+            if pd.notna(delta):
+                if pd.notna(side_total) and side_total > 0:
+                    ratio = abs(delta) / side_total
+                else:
+                    ratio = np.nan
+                if delta > 0:
+                    score += 3
+                    reasons.append("positive footprint Delta")
+                    if pd.notna(ratio) and ratio >= 0.25:
+                        score += 2
+                        reasons.append("strong positive Delta/volume")
+                elif delta < 0:
+                    score -= 3
+                    reasons.append("negative footprint Delta")
+                    if pd.notna(ratio) and ratio >= 0.25:
+                        score -= 2
+                        reasons.append("strong negative Delta/volume")
+
+            # Buy/sell volume dominance.
+            if pd.notna(delta_pct):
+                if delta_pct >= 25:
+                    score += 2
+                    reasons.append("buy volume dominates")
+                elif delta_pct <= -25:
+                    score -= 2
+                    reasons.append("sell volume dominates")
+
+            # Intrabar Delta extremes: useful for absorption/exhaustion context.
+            if pd.notna(max_delta) and pd.notna(min_delta):
+                if max_delta > 0 and min_delta < 0:
+                    swing = max_delta + abs(min_delta)
+                    if pd.notna(delta) and swing > 0 and abs(delta) <= 0.20 * swing:
+                        reasons.append("large two-sided Delta swing with weak close")
+                        if delta >= 0:
+                            score -= 1
+                        else:
+                            score += 1
+
+                if pd.notna(delta):
+                    if delta > 0 and max_delta > 0 and abs(min_delta) >= 1.5 * abs(max_delta):
+                        score -= 2
+                        reasons.append("buying pressure absorbed by strong negative excursion")
+                    elif delta < 0 and min_delta < 0 and max_delta >= 1.5 * abs(min_delta):
+                        score += 2
+                        reasons.append("selling pressure absorbed by strong positive excursion")
+
+            # CVD direction and acceleration.
+            cvd_change_5 = np.nan
+            cvd_change_10 = np.nan
+            if "cvd" in rows.columns and len(rows) >= 5:
+                cvd_series = pd.to_numeric(rows["cvd"], errors="coerce")
+                cvd_now = cvd_series.iloc[-1]
+                cvd_old5 = cvd_series.iloc[-5]
+                if pd.notna(cvd_now) and pd.notna(cvd_old5):
+                    cvd_change_5 = cvd_now - cvd_old5
+                    if cvd_change_5 > 0:
+                        score += 2
+                        reasons.append("CVD rising")
+                    elif cvd_change_5 < 0:
+                        score -= 2
+                        reasons.append("CVD falling")
+            if "cvd" in rows.columns and len(rows) >= 10:
+                cvd_series = pd.to_numeric(rows["cvd"], errors="coerce")
+                a = cvd_series.iloc[-5]
+                b = cvd_series.iloc[-10]
+                if pd.notna(a) and pd.notna(b):
+                    cvd_change_10 = a - b
+                    if pd.notna(cvd_change_5):
+                        if cvd_change_5 > cvd_change_10 > 0:
+                            score += 1
+                            reasons.append("CVD acceleration positive")
+                        elif cvd_change_5 < cvd_change_10 < 0:
+                            score -= 1
+                            reasons.append("CVD acceleration negative")
+
+            # Trade-count confirmation, if supplied.
+            buy_trades = pd.to_numeric(row.get("buytrades"), errors="coerce")
+            sell_trades = pd.to_numeric(row.get("selltrades"), errors="coerce")
+            trades = pd.to_numeric(row.get("trades"), errors="coerce")
+            if pd.notna(buy_trades) and pd.notna(sell_trades) and buy_trades + sell_trades > 0:
+                trade_delta_pct = (buy_trades - sell_trades) / (buy_trades + sell_trades) * 100
+                if trade_delta_pct >= 30:
+                    score += 1
+                    reasons.append("buy-trade count dominates")
+                elif trade_delta_pct <= -30:
+                    score -= 1
+                    reasons.append("sell-trade count dominates")
+
+            # Normalized extreme-Deltas for cross-stock comparison.
+            extreme_ratio = np.nan
+            if pd.notna(max_delta) and pd.notna(min_delta) and pd.notna(side_total) and side_total > 0:
+                extreme_ratio = (max_delta - min_delta) / side_total
+                if extreme_ratio >= 1.0:
+                    reasons.append("wide intrabar Delta range")
+
+            direction = "BUY" if score >= 4 else "SELL" if score <= -4 else "NEUTRAL"
+            return {
+                "source": "GOCHARTING_REAL",
+                "delta": delta, "buy": buy, "sell": sell,
+                "max_delta": max_delta, "min_delta": min_delta, "cvd": cvd,
+                "delta_pct": delta_pct, "cvd_change_5": cvd_change_5,
+                "extreme_ratio": extreme_ratio, "trades": trades,
+                "score": score, "direction": direction,
+                "reason": "; ".join(reasons)
+            }
+
+    # Fallback: OHLCV pressure proxy, clearly marked as non-footprint data.
     delta_pct = r["DELTA_PROXY_PCT"]
     cvd_slope = r["CVD_SLOPE"]
     score = 0
@@ -239,11 +337,14 @@ def orderflow_analysis(symbol, df, real_of):
             score -= 1; reasons.append("possible buying absorption proxy")
         else:
             score += 1; reasons.append("possible selling absorption proxy")
-    return {"source": "OHLCV_PROXY", "delta": np.nan, "buy": np.nan, "sell": np.nan,
-            "max_delta": np.nan, "min_delta": np.nan, "cvd": r["CVD_PROXY"],
-            "delta_pct": delta_pct, "score": score,
-            "direction": "BUY" if score >= 3 else "SELL" if score <= -3 else "NEUTRAL",
-            "reason": "; ".join(reasons)}
+    return {
+        "source": "OHLCV_PROXY", "delta": np.nan, "buy": np.nan, "sell": np.nan,
+        "max_delta": np.nan, "min_delta": np.nan, "cvd": r["CVD_PROXY"],
+        "delta_pct": delta_pct, "cvd_change_5": np.nan, "extreme_ratio": np.nan,
+        "trades": np.nan, "score": score,
+        "direction": "BUY" if score >= 3 else "SELL" if score <= -3 else "NEUTRAL",
+        "reason": "; ".join(reasons)
+    }
 
 def timeframe_score(df, label):
     if df.empty or len(df) < 30:
@@ -380,6 +481,11 @@ def scan_symbol(symbol, period, interval, real_of):
             "Order Flow": of["direction"], "Order Flow Source": of["source"],
             "Order Flow Score": of["score"],
             "CVD": round(float(of["cvd"]), 2) if pd.notna(of["cvd"]) else np.nan,
+            "CVD Change 5": round(float(of["cvd_change_5"]), 2) if pd.notna(of["cvd_change_5"]) else np.nan,
+            "Max Delta": round(float(of["max_delta"]), 2) if pd.notna(of["max_delta"]) else np.nan,
+            "Min Delta": round(float(of["min_delta"]), 2) if pd.notna(of["min_delta"]) else np.nan,
+            "Extreme Delta Ratio": round(float(of["extreme_ratio"]), 2) if pd.notna(of["extreme_ratio"]) else np.nan,
+            "Trades": round(float(of["trades"]), 0) if pd.notna(of["trades"]) else np.nan,
             "Reasons": " | ".join(reasons),
             "Warning": "OHLCV Delta proxy — not footprint Delta" if of["source"] == "OHLCV_PROXY" else "Genuine GoCharting order-flow supplied",
         }
@@ -489,20 +595,20 @@ if "final_df" in st.session_state:
     if final_df.empty:
         st.warning("No stock crossed the current final-signal threshold.")
     else:
-        display = ["Symbol", "Signal", "Score", "Price", "Entry", "Stop Loss", "Target", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source", "CVD"]
+        display = ["Symbol", "Signal", "Score", "Price", "Entry", "Stop Loss", "Target", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source", "CVD", "CVD Change 5", "Max Delta", "Min Delta", "Extreme Delta Ratio"]
         st.dataframe(final_df[display], use_container_width=True, hide_index=True)
 
         st.subheader("🔎 Why each signal was produced")
         for _, row in final_df.iterrows():
             with st.expander(f"{row['Symbol']} — {row['Signal']} — Score {row['Score']}"):
                 st.write(f"Price: {row['Price']} | Entry: {row['Entry']} | SL: {row['Stop Loss']} | Target: {row['Target']}")
-                st.write(f"Order-flow source: {row['Order Flow Source']} | Delta %: {row['Delta %']} | CVD: {row['CVD']}")
+                st.write(f"Order-flow source: {row['Order Flow Source']} | Delta %: {row['Delta %']} | CVD: {row['CVD']} | CVD Δ5: {row['CVD Change 5']}")
                 st.write("Reason:")
                 st.write(row["Reasons"])
                 st.warning(row["Warning"])
 
     st.subheader("📋 Top Candidates")
-    st.dataframe(candidates[["Symbol", "Signal", "Score", "Price", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source"]], use_container_width=True, hide_index=True)
+    st.dataframe(candidates[["Symbol", "Signal", "Score", "Price", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source", "CVD Change 5", "Extreme Delta Ratio"]], use_container_width=True, hide_index=True)
 
     st.subheader("📥 Download Results")
     excel_buffer = io.BytesIO()

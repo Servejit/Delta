@@ -93,6 +93,56 @@ def session_vwap(df):
     dates = pd.Series(df.index.date, index=df.index)
     return pv.groupby(dates).cumsum() / df["Volume"].groupby(dates).cumsum().replace(0, np.nan)
 
+def session_volume_profile(df, value_area_pct=0.70, bins=48):
+    """Approximate session POC/VAH/VAL from OHLCV bars.
+    This is NOT footprint price-level volume; genuine price-level profile data
+    must come from a footprint/volume-profile export.
+    """
+    if df.empty:
+        return np.nan, np.nan, np.nan
+    x = df.tail(min(len(df), 240)).copy()
+    lo = float(x["Low"].min())
+    hi = float(x["High"].max())
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.nan, np.nan, np.nan
+    edges = np.linspace(lo, hi, bins + 1)
+    mids = (edges[:-1] + edges[1:]) / 2
+    vol = np.zeros(bins, dtype=float)
+    for _, row in x.iterrows():
+        low = float(row["Low"]); high = float(row["High"]); v = float(row["Volume"])
+        if not np.isfinite(v) or v <= 0:
+            continue
+        if high <= low:
+            idx = int(np.clip(np.searchsorted(edges, float(row["Close"])) - 1, 0, bins - 1))
+            vol[idx] += v
+            continue
+        touched = np.where((mids >= low) & (mids <= high))[0]
+        if len(touched) == 0:
+            idx = int(np.clip(np.searchsorted(edges, (low + high) / 2) - 1, 0, bins - 1))
+            vol[idx] += v
+        else:
+            vol[touched] += v / len(touched)
+    if vol.sum() <= 0:
+        return np.nan, np.nan, np.nan
+    poc_i = int(np.argmax(vol))
+    target = vol.sum() * value_area_pct
+    selected = {poc_i}
+    total = vol[poc_i]
+    left = poc_i - 1
+    right = poc_i + 1
+    while total < target and (left >= 0 or right < bins):
+        lv = vol[left] if left >= 0 else -1
+        rv = vol[right] if right < bins else -1
+        if rv > lv:
+            selected.add(right); total += rv; right += 1
+        elif left >= 0:
+            selected.add(left); total += lv; left -= 1
+        else:
+            break
+    va_low = float(mids[min(selected)])
+    va_high = float(mids[max(selected)])
+    return float(mids[poc_i]), va_high, va_low
+
 def add_indicators(df):
     x = df.copy()
     x["EMA9"] = ema(x["Close"], 9)
@@ -372,6 +422,7 @@ def scan_symbol(symbol, period, interval, real_of):
         df15 = add_indicators(resample_ohlcv(df5, "15min"))
         df60 = add_indicators(resample_ohlcv(df5, "60min"))
         r = df5.iloc[-1]
+        poc, vah, val = session_volume_profile(df5)
 
         score = 0
         reasons = []
@@ -408,6 +459,21 @@ def scan_symbol(symbol, period, interval, real_of):
         if pd.notna(r["MACD_HIST"]):
             score += 3 if r["MACD_HIST"] > 0 else -3
 
+        # Approximate volume-profile context from OHLCV.
+        if pd.notna(poc) and pd.notna(vah) and pd.notna(val):
+            if r["Close"] > vah:
+                score += 3
+                reasons.append("price above approximate VAH")
+            elif r["Close"] < val:
+                score -= 3
+                reasons.append("price below approximate VAL")
+            elif r["Close"] >= poc:
+                score += 1
+                reasons.append("price at/above approximate POC")
+            else:
+                score -= 1
+                reasons.append("price below approximate POC")
+
         of = orderflow_analysis(symbol, df5, real_of)
         score += of["score"] * (5 if of["source"] == "GOCHARTING_REAL" else 3)
         if of["reason"]:
@@ -434,7 +500,22 @@ def scan_symbol(symbol, period, interval, real_of):
 
         recent = df5.tail(10)
         price_change = recent["Close"].iloc[-1] - recent["Close"].iloc[0]
-        delta_mean = recent["DELTA_PROXY"].mean()
+        if of["source"] == "GOCHARTING_REAL":
+            of_rows = real_of[real_of["Symbol"] == symbol].sort_values("DateTime")
+            delta_series = pd.to_numeric(of_rows["delta"], errors="coerce").dropna()
+            delta_mean = delta_series.tail(10).mean() if not delta_series.empty else np.nan
+            if len(of_rows) >= 10:
+                d0 = pd.to_numeric(of_rows["delta"], errors="coerce").iloc[-10]
+                d1 = pd.to_numeric(of_rows["delta"], errors="coerce").iloc[-1]
+                if pd.notna(d0) and pd.notna(d1):
+                    if price_change > 0 and d1 < d0:
+                        score -= 5
+                        reasons.append("bearish price/real-Delta divergence")
+                    elif price_change < 0 and d1 > d0:
+                        score += 5
+                        reasons.append("bullish price/real-Delta divergence")
+        else:
+            delta_mean = recent["DELTA_PROXY"].mean()
         if price_change > 0 and delta_mean < 0:
             score -= 4; reasons.append("price up while Delta proxy weakens")
         elif price_change < 0 and delta_mean > 0:
@@ -481,6 +562,9 @@ def scan_symbol(symbol, period, interval, real_of):
             "Order Flow": of["direction"], "Order Flow Source": of["source"],
             "Order Flow Score": of["score"],
             "CVD": round(float(of["cvd"]), 2) if pd.notna(of["cvd"]) else np.nan,
+            "Approx POC": round(poc, 2) if pd.notna(poc) else np.nan,
+            "Approx VAH": round(vah, 2) if pd.notna(vah) else np.nan,
+            "Approx VAL": round(val, 2) if pd.notna(val) else np.nan,
             "CVD Change 5": round(float(of["cvd_change_5"]), 2) if pd.notna(of["cvd_change_5"]) else np.nan,
             "Max Delta": round(float(of["max_delta"]), 2) if pd.notna(of["max_delta"]) else np.nan,
             "Min Delta": round(float(of["min_delta"]), 2) if pd.notna(of["min_delta"]) else np.nan,
@@ -595,7 +679,7 @@ if "final_df" in st.session_state:
     if final_df.empty:
         st.warning("No stock crossed the current final-signal threshold.")
     else:
-        display = ["Symbol", "Signal", "Score", "Price", "Entry", "Stop Loss", "Target", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source", "CVD", "CVD Change 5", "Max Delta", "Min Delta", "Extreme Delta Ratio"]
+        display = ["Symbol", "Signal", "Score", "Price", "Entry", "Stop Loss", "Target", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source", "CVD", "CVD Change 5", "Max Delta", "Min Delta", "Extreme Delta Ratio", "Approx POC", "Approx VAH", "Approx VAL"]
         st.dataframe(final_df[display], use_container_width=True, hide_index=True)
 
         st.subheader("🔎 Why each signal was produced")
@@ -608,7 +692,7 @@ if "final_df" in st.session_state:
                 st.warning(row["Warning"])
 
     st.subheader("📋 Top Candidates")
-    st.dataframe(candidates[["Symbol", "Signal", "Score", "Price", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source", "CVD Change 5", "Extreme Delta Ratio"]], use_container_width=True, hide_index=True)
+    st.dataframe(candidates[["Symbol", "Signal", "Score", "Price", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source", "CVD Change 5", "Extreme Delta Ratio", "Approx POC", "Approx VAH", "Approx VAL"]], use_container_width=True, hide_index=True)
 
     st.subheader("📥 Download Results")
     excel_buffer = io.BytesIO()

@@ -120,22 +120,67 @@ def add_indicators(df):
     return x
 
 @st.cache_data(show_spinner=False)
-def read_orderflow(uploaded_bytes):
-    if not uploaded_bytes:
+def read_orderflow(uploaded_items):
+    """Read GoCharting chart-data CSV exports with flexible column names."""
+    if not uploaded_items:
         return pd.DataFrame()
-    try:
-        x = pd.read_csv(io.BytesIO(uploaded_bytes))
-        required = ["Symbol", "DateTime", "Delta"]
-        if any(c not in x.columns for c in required):
-            return pd.DataFrame()
-        x["Symbol"] = x["Symbol"].astype(str).str.upper().str.strip()
-        x["DateTime"] = pd.to_datetime(x["DateTime"], errors="coerce")
-        for c in ["BuyVolume", "SellVolume", "MaxDelta", "MinDelta", "CVD"]:
-            if c not in x.columns:
-                x[c] = np.nan
-        return x.dropna(subset=["Symbol", "DateTime"]).sort_values("DateTime")
-    except Exception:
+    if not isinstance(uploaded_items, list):
+        uploaded_items = [uploaded_items]
+    frames = []
+    aliases = {
+        "symbol": ["symbol", "ticker", "instrument", "security"],
+        "datetime": ["datetime", "date time", "date_time", "timestamp", "time", "date"],
+        "delta": ["delta", "orderflow delta", "bar delta", "of delta"],
+        "buyvolume": ["buyvolume", "buy volume", "buy_volume", "ask volume", "askvolume", "aggressive buy volume"],
+        "sellvolume": ["sellvolume", "sell volume", "sell_volume", "bid volume", "bidvolume", "aggressive sell volume"],
+        "maxdelta": ["maxdelta", "max delta", "max_delta"],
+        "mindelta": ["mindelta", "min delta", "min_delta"],
+        "cvd": ["cvd", "cumulative delta", "cumulative volume delta"],
+        "buytrades": ["buy", "buy trades", "buytrades"],
+        "selltrades": ["sell", "sell trades", "selltrades"],
+        "trades": ["trades", "total trades", "trade count"],
+    }
+    def norm(s):
+        return "".join(ch for ch in str(s).strip().lower() if ch.isalnum())
+    def find_col(columns, names):
+        lookup = {norm(col): col for col in columns}
+        for name in names:
+            if norm(name) in lookup:
+                return lookup[norm(name)]
+        return None
+    for item in uploaded_items:
+        try:
+            raw = item.getvalue() if hasattr(item, "getvalue") else item
+            x = pd.read_csv(io.BytesIO(raw))
+            mapping = {}
+            for target, names in aliases.items():
+                col = find_col(x.columns, names)
+                if col is not None:
+                    mapping[target] = col
+            if "datetime" not in mapping or "delta" not in mapping:
+                continue
+            out = pd.DataFrame()
+            out["DateTime"] = pd.to_datetime(x[mapping["datetime"]], errors="coerce")
+            if "symbol" in mapping:
+                out["Symbol"] = x[mapping["symbol"]].astype(str).str.upper().str.strip()
+            else:
+                filename = getattr(item, "name", "")
+                inferred = str(filename).upper().replace(".CSV", "").replace(".NS", "")
+                out["Symbol"] = inferred.strip()
+            for target in ["delta", "buyvolume", "sellvolume", "maxdelta", "mindelta", "cvd", "buytrades", "selltrades", "trades"]:
+                out[target] = pd.to_numeric(x[mapping[target]], errors="coerce") if target in mapping else np.nan
+            out["Symbol"] = out["Symbol"].str.replace(r"[^A-Z0-9&_-]", "", regex=True)
+            out["Symbol"] = out["Symbol"].str.replace("_NS", "", regex=False).str.replace("-NS", "", regex=False)
+            out = out.dropna(subset=["DateTime", "Symbol", "delta"])
+            if not out.empty:
+                frames.append(out)
+        except Exception:
+            continue
+    if not frames:
         return pd.DataFrame()
+    result = pd.concat(frames, ignore_index=True)
+    result = result.drop_duplicates(subset=["Symbol", "DateTime"], keep="last")
+    return result.sort_values(["Symbol", "DateTime"]).reset_index(drop=True)
 
 def orderflow_analysis(symbol, df, real_of):
     r = df.iloc[-1]
@@ -267,6 +312,25 @@ def scan_symbol(symbol, period, interval, real_of):
         if of["reason"]:
             reasons.append(of["reason"])
 
+        if of["source"] == "GOCHARTING_REAL":
+            if pd.notna(of["buy"]) and pd.notna(of["sell"]):
+                total_side_volume = float(of["buy"]) + float(of["sell"])
+                if total_side_volume > 0:
+                    buy_share = float(of["buy"]) / total_side_volume
+                    if buy_share >= 0.65:
+                        score += 3; reasons.append("buy volume dominates sell volume")
+                    elif buy_share <= 0.35:
+                        score -= 3; reasons.append("sell volume dominates buy volume")
+            prior = real_of[real_of["Symbol"] == symbol].sort_values("DateTime")
+            if "cvd" in prior.columns and len(prior) >= 5:
+                cvd_now = pd.to_numeric(prior["cvd"], errors="coerce").iloc[-1]
+                cvd_old = pd.to_numeric(prior["cvd"], errors="coerce").iloc[-5]
+                if pd.notna(cvd_now) and pd.notna(cvd_old):
+                    if cvd_now > cvd_old:
+                        score += 2; reasons.append("GoCharting CVD rising")
+                    elif cvd_now < cvd_old:
+                        score -= 2; reasons.append("GoCharting CVD falling")
+
         recent = df5.tail(10)
         price_change = recent["Close"].iloc[-1] - recent["Close"].iloc[0]
         delta_mean = recent["DELTA_PROXY"].mean()
@@ -332,15 +396,22 @@ with st.sidebar:
     strong_threshold = st.slider("Strong signal threshold", 70, 95, STRONG_THRESHOLD)
     real_required = st.checkbox("Require genuine GoCharting order flow", value=False)
     st.divider()
-    st.markdown("Real order-flow CSV columns: Symbol, DateTime, Delta, BuyVolume, SellVolume, MaxDelta, MinDelta, CVD")
+    st.markdown("GoCharting export: Time/DateTime + Delta required; Symbol, BuyVolume, SellVolume, MaxDelta, MinDelta and CVD are supported when present.")
 
-uploaded = st.file_uploader("Optional: upload genuine GoCharting order-flow CSV", type=["csv"])
-real_of = read_orderflow(uploaded.getvalue() if uploaded else None)
+uploaded = st.file_uploader(
+    "Optional: upload GoCharting chart-data CSV export(s)",
+    type=["csv"],
+    accept_multiple_files=True,
+    help="Upload one combined CSV or multiple GoCharting exports. If Symbol is absent, the stock symbol is inferred from the filename."
+)
+real_of = read_orderflow(uploaded)
 
 if not real_of.empty:
-    st.success(f"Loaded {len(real_of):,} genuine order-flow rows.")
+    st.success(f"Loaded {len(real_of):,} genuine order-flow rows for {real_of["Symbol"].nunique()} symbol(s).")
+    with st.expander("Loaded GoCharting data preview"):
+        st.dataframe(real_of.tail(20), use_container_width=True, hide_index=True)
 else:
-    st.info("No genuine order-flow CSV loaded. The scanner will use an OHLCV Delta/CVD proxy and label it clearly.")
+    st.info("No usable GoCharting order-flow CSV loaded. The scanner will use an OHLCV Delta/CVD proxy and label it clearly.")
 
 symbols, _ = get_nifty200()
 st.write(f"**Nifty 200 symbols available:** {len(symbols)}")

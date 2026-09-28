@@ -412,9 +412,23 @@ def timeframe_score(df, label):
         score += 1 if r["MACD_HIST"] > 0 else -1
     return score, "; ".join(reasons)
 
-def scan_symbol(symbol, period, interval, real_of):
+def scan_symbol(symbol, period, interval, real_of, downloaded=None):
     try:
-        data = yf.download(symbol + ".NS", period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+        # Market data is downloaded in batches before scanning. This avoids
+        # hundreds of simultaneous Yahoo requests, which can trigger
+        # throttling/empty responses on Streamlit Cloud.
+        if downloaded is not None and symbol in downloaded:
+            data = downloaded[symbol]
+        else:
+            data = yf.download(
+                symbol + ".NS",
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                timeout=20,
+            )
         df5 = clean_ohlcv(data)
         if len(df5) < 80:
             raise ValueError("insufficient intraday data")
@@ -578,8 +592,10 @@ def scan_symbol(symbol, period, interval, real_of):
 
 with st.sidebar:
     st.header("Scanner Settings")
-    period = st.selectbox("Data period", ["5d", "1mo", "3mo", "6mo", "1y"], index=2)
     interval = st.selectbox("Base timeframe", ["5m", "15m"], index=0)
+    # Yahoo/yfinance limits intraday history to the most recent 60 days.
+    # Keep the UI to periods that reliably work for 5m/15m data.
+    period = st.selectbox("Data period", ["5d", "1mo"], index=1)
     workers = st.slider("Parallel workers", 2, 10, 6)
     buy_threshold = st.slider("BUY threshold", 50, 90, BUY_THRESHOLD)
     sell_threshold = st.slider("SELL threshold", 50, 90, SELL_THRESHOLD)
@@ -608,18 +624,74 @@ st.write(f"**Nifty 200 symbols available:** {len(symbols)}")
 
 run = st.button("🚀 Run Nifty 200 Scanner", type="primary", use_container_width=True)
 
+@st.cache_data(ttl=300, show_spinner=False)
+def download_market_batch(symbols, period, interval):
+    """Download Nifty 200 intraday data in batches instead of 200 individual requests."""
+    output = {}
+    batch_size = 35
+    for start in range(0, len(symbols), batch_size):
+        batch_symbols = symbols[start:start + batch_size]
+        tickers = [s + ".NS" for s in batch_symbols]
+        try:
+            data = yf.download(
+                tickers=tickers,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+                timeout=30,
+            )
+            if data is None or data.empty:
+                continue
+
+            if isinstance(data.columns, pd.MultiIndex):
+                for symbol in batch_symbols:
+                    ticker = symbol + ".NS"
+                    try:
+                        if ticker in data.columns.get_level_values(0):
+                            output[symbol] = data[ticker].copy()
+                        elif ticker in data.columns.get_level_values(1):
+                            output[symbol] = data.xs(ticker, axis=1, level=1).copy()
+                    except Exception:
+                        continue
+            elif len(batch_symbols) == 1:
+                output[batch_symbols[0]] = data.copy()
+        except Exception:
+            continue
+    return output
+
+
 if run:
     progress = st.progress(0)
     status = st.empty()
     results = []
     errors = []
 
+    status.write("Downloading Nifty 200 market data in batches…")
+    downloaded = download_market_batch(symbols, period, interval)
+
+    if not downloaded:
+        st.error(
+            "Yahoo Finance returned no usable intraday data. "
+            "Try again in a few minutes, or use 15m + 5d/1mo. "
+            "The app cannot create genuine order-flow data from Yahoo alone."
+        )
+        st.stop()
+
+    st.info(f"Market data received for {len(downloaded)} of {len(symbols)} Nifty 200 symbols.")
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(scan_symbol, s, period, interval, real_of): s for s in symbols}
+        futures = {
+            executor.submit(scan_symbol, s, period, interval, real_of, downloaded): s
+            for s in symbols
+            if s in downloaded
+        }
         total = len(futures)
         for i, future in enumerate(as_completed(futures), start=1):
             symbol = futures[future]
-            status.write(f"Scanning {symbol} — {i}/{total}")
+            status.write(f"Calculating {symbol} — {i}/{total}")
             try:
                 result = future.result()
                 if "Error" in result:
@@ -629,6 +701,11 @@ if run:
             except Exception as exc:
                 errors.append({"Symbol": symbol, "Error": str(exc)})
             progress.progress(i / total)
+
+    scanned_symbols = set(downloaded.keys())
+    for symbol in symbols:
+        if symbol not in scanned_symbols:
+            errors.append({"Symbol": symbol, "Error": "No Yahoo intraday data returned"})
 
     progress.empty()
     status.empty()

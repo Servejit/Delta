@@ -772,12 +772,36 @@ if "final_df" in st.session_state:
     st.dataframe(candidates[["Symbol", "Signal", "Score", "Price", "RSI", "Volume x", "Delta %", "Order Flow", "Order Flow Source", "CVD Change 5", "Extreme Delta Ratio", "Approx POC", "Approx VAH", "Approx VAL"]], use_container_width=True, hide_index=True)
 
     st.subheader("📥 Download Results")
+    # Excel/openpyxl cannot write timezone-aware datetimes.
+    # yfinance returns timezone-aware intraday timestamps, so remove timezone
+    # information in export copies only; scanner calculations remain unchanged.
+    def excel_safe_dataframe(frame):
+        out = frame.copy()
+        for col in out.columns:
+            try:
+                if pd.api.types.is_datetime64tz_dtype(out[col]):
+                    out[col] = out[col].dt.tz_localize(None)
+                elif out[col].dtype == "object":
+                    vals = out[col].dropna()
+                    if not vals.empty and any(isinstance(v, (pd.Timestamp,)) for v in vals.head(5)):
+                        converted = pd.to_datetime(out[col], errors="coerce", utc=True)
+                        out[col] = converted.dt.tz_localize(None)
+            except Exception:
+                pass
+        return out
+
+    excel_final = excel_safe_dataframe(final_df)
+    excel_candidates = excel_safe_dataframe(candidates)
+    excel_all = excel_safe_dataframe(all_df)
+    excel_errors = excel_safe_dataframe(errors_df)
+
     excel_buffer = io.BytesIO()
     with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        final_df.to_excel(writer, sheet_name="Final_Signals", index=False)
-        candidates.to_excel(writer, sheet_name="Top_Candidates", index=False)
-        all_df.to_excel(writer, sheet_name="All_Stocks", index=False)
-        errors_df.to_excel(writer, sheet_name="Errors", index=False)
+        excel_final.to_excel(writer, sheet_name="Final_Signals", index=False)
+        excel_candidates.to_excel(writer, sheet_name="Top_Candidates", index=False)
+        excel_all.to_excel(writer, sheet_name="All_Stocks", index=False)
+        excel_errors.to_excel(writer, sheet_name="Errors", index=False)
+
 
     st.download_button(
         "⬇️ Download Excel",
